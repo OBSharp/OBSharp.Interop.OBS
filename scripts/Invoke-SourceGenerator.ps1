@@ -17,6 +17,10 @@
     包含目录才能正确解析系统头（例如 <windows.h>）。这些目录通过 vswhere
     定位 Visual Studio 安装位置后取得，无需预先进入开发者命令提示符。
 
+    生成器默认会跳过变参函数；这里统一开启 --allow-variadic，让这类导出
+    至少绑定其定参部分，不会从绑定里静默消失。两趟生成都带上该开关，否则
+    暂存趟的函数名集合会比主趟少，库名改写就对不上。
+
 .PARAMETER ObsStudioDirectory
     obs-studio 源码（含头文件）所在目录。
 
@@ -419,10 +423,13 @@ try {
             '--library-name', $PrimaryLibrary
             '--return-string-marshaller', $ReturnStringMarshaller
             '--nullable-handle-marshaller', $NullableHandleMarshaller
+            # 变参函数只绑定定参部分，而不是整类跳过
+            '--allow-variadic'
             '--'
         ) + [string[]] $clangArguments)
 
     # 从趟：归属其它原生库的头文件逐个单独生成，产物只作暂存，用于取出其导出函数名
+    # 选项必须与主趟一致（含 --allow-variadic），否则函数名集合会与主产物对不上
     foreach ($module in $BindingModules) {
         $moduleStagingDirectory = Join-Path $stagingDirectory $module.Library
         Invoke-BindGenerator -Arguments @(
@@ -430,6 +437,7 @@ try {
             '--csharp-output', $moduleStagingDirectory
             '--namespace', $Namespace
             '--library-name', $module.Library
+            '--allow-variadic'
             '--'
             [string[]] $clangArguments
         )
