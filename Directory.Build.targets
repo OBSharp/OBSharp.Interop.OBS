@@ -9,13 +9,11 @@
   <!-- =====================================================================
        C 绑定生成：dotnet msbuild -t:GenerateObsBindings
 
-       这些头文件只包含 C 导出声明，因此直接按 C 导出生成 P/Invoke，
-       不需要 cpp-redirect 再产出 native 中间层。obs.hpp 只有 C++ 模板与内联
-       函数、没有任何 C 导出，故不纳入生成范围。
-       两个头文件的符号并不在同一个原生库里：obs.h 的符号由 obs 导出，
-       obs-frontend-api.h 的符号由 obs-frontend-api 导出。生成器一次只接受
-       一个 library-name，所以先统一按主库生成，再把归属其它库的函数
-       改写成真实库名（函数名集合由对应头文件单独生成一趟得到）。
+       头文件的清单、生成器参数与「按原生库改写库名」的流程都在
+       scripts/Invoke-SourceGenerator.ps1 里，这里只把 MSBuild 属性传给它。
+       生成器一次只接受一个 library-name：obs.h 的符号由 obs 导出，
+       obs-frontend-api.h 的符号由 obs-frontend-api 导出，所以脚本里先统一
+       按主库生成，再用另一趟得到的函数名集合把库名改回正确值。
        ===================================================================== -->
 
   <PropertyGroup>
@@ -34,154 +32,30 @@
     <ObsNullableHandleMarshaller Condition=" '$(ObsNullableHandleMarshaller)' == '' ">OBSharp.Interop.OBS.NullableSafeHandleMarshaller</ObsNullableHandleMarshaller>
     <!-- 生成器命令；版本由 dotnet-tools.json 固定 -->
     <ObsBindingGeneratorCommand Condition=" '$(ObsBindingGeneratorCommand)' == '' ">dotnet tool run OBSharp.Interop.NativeBindGenerator</ObsBindingGeneratorCommand>
+    <!-- 生成脚本 -->
+    <ObsBindingGeneratorScript Condition=" '$(ObsBindingGeneratorScript)' == '' ">$(MSBuildThisFileDirectory)scripts/Invoke-SourceGenerator.ps1</ObsBindingGeneratorScript>
   </PropertyGroup>
 
-  <ItemGroup>
-    <!-- 归属主库的头文件。obs.h 只是伞形头文件，生成器只收集显式列出
-         的头文件里的声明，因此 libobs 的公开头文件必须逐一列出。 -->
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-data.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-properties.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-interaction.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-missing-files.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-source.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-encoder.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-output.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-service.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-hotkey.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-audio-controls.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-module.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-avc.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-hevc.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-av1.h" />
-    <ObsBindingHeader Include="$(ObsStudioDirectory)libobs/obs-nal.h" />
-    <!-- 归属其它原生库的头文件；Library 元数据是其符号真正所在的库名 -->
-    <ObsBindingModule Include="$(ObsStudioDirectory)frontend/api/obs-frontend-api.h">
-      <Library>obs-frontend-api</Library>
-    </ObsBindingModule>
-  </ItemGroup>
-
-  <!-- 把主产物中「实际由其它原生库导出」的函数改写成正确的库名。 -->
-  <UsingTask TaskName="RetargetObsBindingLibrary" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
-    <ParameterGroup>
-      <ModulePattern ParameterType="System.String" Required="true" />
-      <OutputDirectory ParameterType="System.String" Required="true" />
-    </ParameterGroup>
-    <Task>
-      <Code Type="Fragment" Language="cs">
-        <![CDATA[
-        const string importPattern = "\\[LibraryImport\\(\"([^\"]+)\", EntryPoint = \"([^\"]+)\"\\)\\]";
-
-        // 暂存产物只用来建立「函数名 -> 真实库名」的映射
-        var moduleLibraries = new System.Collections.Generic.Dictionary<string, string>(System.StringComparer.Ordinal);
-        foreach (string moduleFile in System.IO.Directory.GetFiles(ModulePattern, "*.g.cs", System.IO.SearchOption.AllDirectories))
-        {
-            string moduleText = System.IO.File.ReadAllText(moduleFile);
-            foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(moduleText, importPattern))
-                moduleLibraries[match.Groups[2].Value] = match.Groups[1].Value;
-        }
-
-        if (moduleLibraries.Count == 0)
-        {
-            Log.LogError("没有从暂存产物中读到任何导出函数：" + ModulePattern);
-            return false;
-        }
-
-        var retargeted = new System.Collections.Generic.List<string>();
-        int entries = 0;
-        foreach (string outputFile in System.IO.Directory.GetFiles(OutputDirectory, "*.g.cs", System.IO.SearchOption.AllDirectories))
-        {
-            string outputText = System.IO.File.ReadAllText(outputFile);
-            bool changed = false;
-
-            string updatedText = System.Text.RegularExpressions.Regex.Replace(
-                outputText,
-                importPattern,
-                delegate(System.Text.RegularExpressions.Match match)
-                {
-                    string entryPoint = match.Groups[2].Value;
-                    if (!moduleLibraries.TryGetValue(entryPoint, out string library))
-                        return match.Value;
-
-                    entries++;
-                    if (string.Equals(library, match.Groups[1].Value, System.StringComparison.Ordinal))
-                        return match.Value;
-
-                    changed = true;
-                    return "[LibraryImport(\"" + library + "\", EntryPoint = \"" + entryPoint + "\")]";
-                });
-
-            if (!changed)
-                continue;
-
-            System.IO.File.WriteAllText(outputFile, updatedText, new System.Text.UTF8Encoding(false));
-            retargeted.Add(System.IO.Path.GetFileName(outputFile));
-        }
-
-        if (entries != moduleLibraries.Count)
-        {
-            Log.LogError(
-                "主产物中只找到 " + entries + " 个模块导出函数，少于暂存产物的 " + moduleLibraries.Count + " 个，请检查头文件是否同时参与主趟生成。");
-            return false;
-        }
-
-        Log.LogMessage(
-            Microsoft.Build.Framework.MessageImportance.High,
-            "已修正 " + entries + " 个函数、共 " + retargeted.Count + " 个文件的 LibraryImport 库名：" + string.Join(", ", retargeted));
-        ]]>
-      </Code>
-    </Task>
-  </UsingTask>
+  <!-- 传参前去掉目录末尾的分隔符：以反斜杠结尾的路径会把闭合引号转义掉。 -->
+  <PropertyGroup>
+    <_ObsStudioDirectoryArgument>$([MSBuild]::Escape($(ObsStudioDirectory.TrimEnd('\').TrimEnd('/'))))</_ObsStudioDirectoryArgument>
+    <_ObsGeneratedDirectoryArgument>$([MSBuild]::Escape($(ObsGeneratedDirectory.TrimEnd('\').TrimEnd('/'))))</_ObsGeneratedDirectoryArgument>
+    <_ObsGenerationWorkDirectoryArgument>$([MSBuild]::Escape($(ObsGenerationWorkDirectory.TrimEnd('\').TrimEnd('/'))))</_ObsGenerationWorkDirectoryArgument>
+    <_ObsBindingGeneratorScriptArgument>$([MSBuild]::Escape($(ObsBindingGeneratorScript.TrimEnd('\').TrimEnd('/'))))</_ObsBindingGeneratorScriptArgument>
+  </PropertyGroup>
 
   <Target Name="GenerateObsBindings">
-    <PropertyGroup>
-      <_ObsConfigStubDirectory>$(ObsGenerationWorkDirectory)include/</_ObsConfigStubDirectory>
-    </PropertyGroup>
-
     <Error
       Condition=" !Exists('$(ObsStudioDirectory)libobs/obs.h') "
       Text="未找到 obs-studio 头文件：$(ObsStudioDirectory)libobs/obs.h。请先初始化 lib/obs-studio 子模块。" />
 
-    <!-- obsconfig.h 由 CMake 配置时生成，源码树里没有；绑定只需要宏可见，取值无关。 -->
-    <MakeDir Directories="$(_ObsConfigStubDirectory)" />
-    <WriteLinesToFile
-      File="$(_ObsConfigStubDirectory)obsconfig.h"
-      Lines="#pragma once;#define OBS_DATA_PATH &quot;data&quot;;#define OBS_PLUGIN_PATH &quot;plugins&quot;;#define OBS_PLUGIN_DESTINATION &quot;plugins&quot;;#define OBS_INSTALL_PREFIX &quot;&quot;;#define OBS_RELEASE_CANDIDATE 0;#define OBS_BETA 0"
-      Overwrite="true"
-      WriteOnlyWhenDifferent="true" />
+    <Error
+      Condition=" !Exists('$(ObsBindingGeneratorScript)') "
+      Text="未找到绑定生成脚本：$(ObsBindingGeneratorScript)。" />
 
-    <ItemGroup>
-      <_ObsAllBindingHeader Include="@(ObsBindingHeader)" />
-      <_ObsAllBindingHeader Include="@(ObsBindingModule)" />
-      <_ObsHeaderArgument Include="@(_ObsAllBindingHeader->'--header &quot;%(Identity)&quot;')" />
-    </ItemGroup>
-
-    <PropertyGroup>
-      <_ObsHeaderArguments>@(_ObsHeaderArgument, ' ')</_ObsHeaderArguments>
-      <_ObsClangArguments>-x c -I &quot;$(_ObsConfigStubDirectory)&quot; -I &quot;$(ObsStudioDirectory)libobs&quot;</_ObsClangArguments>
-    </PropertyGroup>
-
-    <RemoveDir Directories="$(ObsGenerationWorkDirectory)staging" />
-    <MakeDir Directories="$(ObsGeneratedDirectory)" />
-
-    <Message Importance="High" Text="正在生成 OBS 绑定到 $(ObsGeneratedDirectory)" />
-
-    <!-- 主趟：全部头文件一起生成，库名统一按主库 -->
     <Exec
-      Command="$(ObsBindingGeneratorCommand) $(_ObsHeaderArguments) --csharp-output &quot;$(ObsGeneratedDirectory)&quot; --namespace $(ObsGeneratedNamespace) --library-name $(ObsPrimaryLibrary) --return-string-marshaller $(ObsReturnStringMarshaller) --nullable-handle-marshaller $(ObsNullableHandleMarshaller) -- $(_ObsClangArguments)"
+      Command="pwsh -NoLogo -NoProfile -File &quot;$(_ObsBindingGeneratorScriptArgument)&quot; -ObsStudioDirectory &quot;$(_ObsStudioDirectoryArgument)&quot; -GeneratedDirectory &quot;$(_ObsGeneratedDirectoryArgument)&quot; -WorkDirectory &quot;$(_ObsGenerationWorkDirectoryArgument)&quot; -Namespace &quot;$(ObsGeneratedNamespace)&quot; -PrimaryLibrary &quot;$(ObsPrimaryLibrary)&quot; -ReturnStringMarshaller &quot;$(ObsReturnStringMarshaller)&quot; -NullableHandleMarshaller &quot;$(ObsNullableHandleMarshaller)&quot; -GeneratorCommand &quot;$(ObsBindingGeneratorCommand)&quot;"
       WorkingDirectory="$(MSBuildThisFileDirectory)" />
-
-    <!-- 从趟：归属其它原生库的头文件逐个单独生成，产物只作暂存，用于取出其导出函数名。 -->
-    <Exec
-      Condition=" '@(ObsBindingModule)' != '' "
-      Command="$(ObsBindingGeneratorCommand) --header &quot;%(ObsBindingModule.Identity)&quot; --csharp-output &quot;$(ObsGenerationWorkDirectory)staging/%(ObsBindingModule.Library)&quot; --namespace $(ObsGeneratedNamespace) --library-name %(ObsBindingModule.Library) -- $(_ObsClangArguments)"
-      WorkingDirectory="$(MSBuildThisFileDirectory)" />
-
-    <RetargetObsBindingLibrary
-      ModulePattern="$(ObsGenerationWorkDirectory)staging"
-      OutputDirectory="$(ObsGeneratedDirectory)" />
-
-    <Message Importance="High" Text="OBS 绑定生成完成：$(ObsGeneratedDirectory)" />
   </Target>
 
 </Project>
