@@ -10,16 +10,21 @@
 
     两个头文件的符号并不在同一个原生库里：obs.h 的符号由 obs 导出，
     obs-frontend-api.h 的符号由 obs-frontend-api 导出。生成器一次只接受
-    一个 library-name，所以先统一按主库生成，再把归属其它库的函数改写成
-    真实库名（函数名集合由对应头文件单独生成一趟得到）。
+    一个 library-name，所以主趟先统一按主库生成，之后再把归属其它库的函数
+    改写成真实库名。
+
+    生成器 0.0.1-alpha.7 会按整个翻译单元收集导出声明，连 --header 头文件
+    所包含的头文件也算在内。因此单跑模块头文件得到的函数名集合会混入 libobs
+    的导出，不能再用来判断归属；改为比较「主库头文件趟」与「主库头文件 +
+    模块头文件趟」，两者的差集才是模块头文件新增的导出。
 
     头文件解析由 libclang 完成，Windows 上还需要 MSVC 与 Windows SDK 的
     包含目录才能正确解析系统头（例如 <windows.h>）。这些目录通过 vswhere
     定位 Visual Studio 安装位置后取得，无需预先进入开发者命令提示符。
 
-    生成器默认会跳过变参函数；这里统一开启 --allow-variadic，让这类导出
-    至少绑定其定参部分，不会从绑定里静默消失。两趟生成都带上该开关，否则
-    暂存趟的函数名集合会比主趟少，库名改写就对不上。
+    生成器 0.0.1-alpha.7 起按生成模式拆分为 c/cpp/qt 子命令，本脚本使用 c
+    （直接从 C 头文件生成，不产出 native shim）。该版本默认会为变参函数绑定
+    其定参部分，旧版的 --allow-variadic 开关已移除，各趟生成都无需再传它。
 
 .PARAMETER ObsStudioDirectory
     obs-studio 源码（含头文件）所在目录。
@@ -28,7 +33,7 @@
     C# 产物目录。
 
 .PARAMETER WorkDirectory
-    生成过程的中间文件目录（obsconfig.h 桩、按模块暂存的产物）。
+    生成过程的中间文件目录（obsconfig.h 桩、基线趟与按模块暂存的产物）。
 
 .PARAMETER Namespace
     生成的 C# 命名空间。
@@ -76,8 +81,8 @@ $ErrorActionPreference = 'Stop'
 
 $RootPath = Split-Path -Parent $PSScriptRoot
 
-# 归属主库的头文件。obs.h 只是伞形头文件，生成器只收集显式列出的头文件
-# 里的声明，因此 libobs 的公开头文件必须逐一列出。
+# 归属主库的头文件。obs.h 只是伞形头文件，只包含 libobs 公开头的一部分，
+# 其余公开头文件需要显式列出，才能进入主库趟的翻译单元。
 $BindingHeaders = @(
     'libobs/obs.h'
     'libobs/obs-data.h'
@@ -296,43 +301,55 @@ function Invoke-BindGenerator {
     }
 }
 
-function Update-BindLibraryNames {
-    param(
-        [Parameter(Mandatory)] [string] $StagingDirectory,
-        [Parameter(Mandatory)] [string] $OutputDirectory
-    )
+function Get-GeneratedEntryPoints {
+    param([Parameter(Mandatory)] [string] $Directory)
 
-    # 暂存产物只用来建立「函数名 -> 真实库名」的映射
-    $moduleLibraries = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-    foreach ($moduleFile in Get-ChildItem -LiteralPath $StagingDirectory -Filter '*.g.cs' -File -Recurse) {
-        $moduleText = Get-Content -LiteralPath $moduleFile.FullName -Raw
-        foreach ($match in [regex]::Matches($moduleText, $LibraryImportPattern)) {
-            $moduleLibraries[$match.Groups[2].Value] = $match.Groups[1].Value
+    # alpha.7 生成的 C# 按类型拆成多个 *.g.cs 变体（.g.d.cs、.g.n.<n>.cs 等），
+    # 这里不限定后缀，只从全部产物里取出导出函数名。
+    $entryPoints = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($file in Get-ChildItem -LiteralPath $Directory -Filter '*.cs' -File -Recurse) {
+        $text = Get-Content -LiteralPath $file.FullName -Raw
+        foreach ($match in [regex]::Matches($text, $LibraryImportPattern)) {
+            [void] $entryPoints.Add($match.Groups[2].Value)
         }
     }
 
-    if ($moduleLibraries.Count -eq 0) {
-        throw "没有从暂存产物中读到任何导出函数：$StagingDirectory"
+    if ($entryPoints.Count -eq 0) {
+        throw "没有从生成产物中读到任何导出函数：$Directory"
     }
 
-    $totalEntries = 0
+    # 用逗号包一层，避免 HashSet 被枚举成数组
+    return , $entryPoints
+}
+
+function Update-BindLibraryNames {
+    param(
+        [Parameter(Mandatory)] [string] $OutputDirectory,
+        [Parameter(Mandatory)] [System.Collections.Generic.Dictionary[string, string]] $FunctionLibraries
+    )
+
+    if ($FunctionLibraries.Count -eq 0) {
+        throw '没有需要修正库名的导出函数。'
+    }
+
+    $foundEntries = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $retargetedFiles = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($outputFile in Get-ChildItem -LiteralPath $OutputDirectory -Filter '*.g.cs' -File -Recurse) {
+    foreach ($outputFile in Get-ChildItem -LiteralPath $OutputDirectory -Filter '*.cs' -File -Recurse) {
         $outputText = Get-Content -LiteralPath $outputFile.FullName -Raw
 
         # 脚本块在 Replace 内同步执行，用哈希表把结果带回外层作用域
-        $state = @{ Entries = 0; Changed = $false }
+        $state = @{ Changed = $false }
         $evaluator = {
             param($match)
 
             $entryPoint = $match.Groups[2].Value
             $library = $null
-            if (-not $moduleLibraries.TryGetValue($entryPoint, [ref] $library)) {
+            if (-not $FunctionLibraries.TryGetValue($entryPoint, [ref] $library)) {
                 return $match.Value
             }
 
-            $state.Entries++
+            [void] $foundEntries.Add($entryPoint)
             if ([string]::Equals($library, $match.Groups[1].Value, [System.StringComparison]::Ordinal)) {
                 return $match.Value
             }
@@ -342,7 +359,6 @@ function Update-BindLibraryNames {
         }
 
         $updatedText = [regex]::Replace($outputText, $LibraryImportPattern, $evaluator)
-        $totalEntries += $state.Entries
 
         if (-not $state.Changed) {
             continue
@@ -352,11 +368,12 @@ function Update-BindLibraryNames {
         $retargetedFiles.Add($outputFile.Name)
     }
 
-    if ($totalEntries -ne $moduleLibraries.Count) {
-        throw "主产物中只找到 $totalEntries 个模块导出函数，少于暂存产物的 $($moduleLibraries.Count) 个，请检查头文件是否同时参与主趟生成。"
+    if ($foundEntries.Count -ne $FunctionLibraries.Count) {
+        $missing = @($FunctionLibraries.Keys | Where-Object { -not $foundEntries.Contains($_) })
+        throw "主产物中只找到 $($foundEntries.Count) 个模块导出函数，少于暂存比对得到的 $($FunctionLibraries.Count) 个；缺少：$($missing -join ', ')。请检查模块头文件是否同时参与主趟生成。"
     }
 
-    Write-Host "已修正 $totalEntries 个函数、共 $($retargetedFiles.Count) 个文件的 LibraryImport 库名：$($retargetedFiles -join ', ')"
+    Write-Host "已修正 $($foundEntries.Count) 个函数、共 $($retargetedFiles.Count) 个文件的 LibraryImport 库名：$($retargetedFiles -join ', ')"
 }
 
 $ObsStudioDirectory = Resolve-RepoPath -Path $ObsStudioDirectory
@@ -400,55 +417,95 @@ foreach ($includeDirectory in $includeDirectories) {
     $clangArguments.Add($includeDirectory)
 }
 
-$headerArguments = [System.Collections.Generic.List[string]]::new()
+$primaryHeaderArguments = [System.Collections.Generic.List[string]]::new()
 foreach ($header in $BindingHeaders) {
-    $headerArguments.Add('--header')
-    $headerArguments.Add((Join-Path $ObsStudioDirectory $header))
+    $primaryHeaderArguments.Add('--header')
+    $primaryHeaderArguments.Add((Join-Path $ObsStudioDirectory $header))
 }
 
+$moduleHeaderArguments = [System.Collections.Generic.List[string]]::new()
 foreach ($module in $BindingModules) {
-    $headerArguments.Add('--header')
-    $headerArguments.Add((Join-Path $ObsStudioDirectory $module.Header))
+    $moduleHeaderArguments.Add('--header')
+    $moduleHeaderArguments.Add((Join-Path $ObsStudioDirectory $module.Header))
 }
 
 Write-Host "正在生成 OBS 绑定到 $GeneratedDirectory"
 
 Push-Location -LiteralPath $RootPath
 try {
-    # 主趟：全部头文件一起生成，库名统一按主库
+    # 基线趟（c 子命令）：只解析主库头文件，得到主库自身的导出函数名集合。
+    # 产物只作暂存，不写入 Generated。
+    $baseStagingDirectory = Join-Path $stagingDirectory 'primary'
     Invoke-BindGenerator -Arguments (@(
-            [string[]] $headerArguments
+            'c'
+            [string[]] $primaryHeaderArguments
+            '--csharp-output', $baseStagingDirectory
+            '--namespace', $Namespace
+            '--library-name', $PrimaryLibrary
+            '--return-string-marshaller', $ReturnStringMarshaller
+            '--nullable-handle-marshaller', $NullableHandleMarshaller
+            '--'
+        ) + [string[]] $clangArguments)
+
+    # 模块趟（c 子命令）：主库头文件 + 模块头文件，产物只作暂存。
+    # 与基线趟的函数名差集就是模块头文件新增的导出。
+    foreach ($module in $BindingModules) {
+        $moduleStagingDirectory = Join-Path $stagingDirectory $module.Library
+        Invoke-BindGenerator -Arguments (@(
+                'c'
+                [string[]] $primaryHeaderArguments
+                '--header', (Join-Path $ObsStudioDirectory $module.Header)
+                '--csharp-output', $moduleStagingDirectory
+                '--namespace', $Namespace
+                '--library-name', $module.Library
+                '--return-string-marshaller', $ReturnStringMarshaller
+                '--nullable-handle-marshaller', $NullableHandleMarshaller
+                '--'
+            ) + [string[]] $clangArguments)
+    }
+
+    # 主趟（c 子命令）：全部头文件一起生成，库名统一按主库
+    Invoke-BindGenerator -Arguments (@(
+            'c'
+            [string[]] $primaryHeaderArguments
+            [string[]] $moduleHeaderArguments
             '--csharp-output', $GeneratedDirectory
             '--namespace', $Namespace
             '--library-name', $PrimaryLibrary
             '--return-string-marshaller', $ReturnStringMarshaller
             '--nullable-handle-marshaller', $NullableHandleMarshaller
-            # 变参函数只绑定定参部分，而不是整类跳过
-            '--allow-variadic'
             '--'
         ) + [string[]] $clangArguments)
-
-    # 从趟：归属其它原生库的头文件逐个单独生成，产物只作暂存，用于取出其导出函数名
-    # 选项必须与主趟一致（含 --allow-variadic），否则函数名集合会与主产物对不上
-    foreach ($module in $BindingModules) {
-        $moduleStagingDirectory = Join-Path $stagingDirectory $module.Library
-        Invoke-BindGenerator -Arguments @(
-            '--header', (Join-Path $ObsStudioDirectory $module.Header)
-            '--csharp-output', $moduleStagingDirectory
-            '--namespace', $Namespace
-            '--library-name', $module.Library
-            '--allow-variadic'
-            '--'
-            [string[]] $clangArguments
-        )
-    }
 }
 finally {
     Pop-Location
 }
 
 if ($BindingModules.Count -gt 0) {
-    Update-BindLibraryNames -StagingDirectory $stagingDirectory -OutputDirectory $GeneratedDirectory
+    # 基线趟与模块趟的函数名差集：只保留模块头文件新增的导出
+    $baseEntryPoints = Get-GeneratedEntryPoints -Directory $baseStagingDirectory
+    $functionLibraries = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+
+    foreach ($module in $BindingModules) {
+        $moduleEntryPoints = Get-GeneratedEntryPoints -Directory (Join-Path $stagingDirectory $module.Library)
+        $added = 0
+        foreach ($entryPoint in $moduleEntryPoints) {
+            if ($baseEntryPoints.Contains($entryPoint)) {
+                continue
+            }
+
+            $functionLibraries[$entryPoint] = $module.Library
+            $added++
+        }
+
+        if ($added -eq 0) {
+            throw "模块头文件 $($module.Header) 没有新增任何导出声明，无法判断归属 $($module.Library) 的函数。请确认该头文件确实声明了库导出的符号。"
+        }
+
+        Write-Host "归属 $($module.Library) 的导出函数：$added 个"
+    }
+
+    Update-BindLibraryNames -OutputDirectory $GeneratedDirectory -FunctionLibraries $functionLibraries
 }
 
 Write-Host "OBS 绑定生成完成：$GeneratedDirectory"
